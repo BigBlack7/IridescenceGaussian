@@ -14,6 +14,7 @@ import nvdiffrast.torch as dr
 
 from . import util
 from . import renderutils as ru
+from .iridescence import compute_iridescent_fresnel
 
 ######################################################################################
 # Utility functions
@@ -171,6 +172,53 @@ class EnvironmentLight(torch.nn.Module):
 
         rgb = specular_linear + diffuse_linear
 
+        return rgb, extras
+
+    def shade_iridescent(self, gb_pos, gb_normal, kd, params, roughness, view_pos):
+        wo = util.safe_normalize(view_pos - gb_pos)
+
+        diffuse_raw = kd
+        reflvec = util.safe_normalize(util.reflect(wo, gb_normal))
+        nrmvec = gb_normal
+
+        if self.mtx is not None:
+            mtx = torch.as_tensor(self.mtx, dtype=torch.float32, device='cuda')
+            reflvec = ru.xfm_vectors(reflvec.view(reflvec.shape[0], reflvec.shape[1] * reflvec.shape[2], reflvec.shape[3]), mtx).view(*reflvec.shape)
+            nrmvec = ru.xfm_vectors(nrmvec.view(nrmvec.shape[0], nrmvec.shape[1] * nrmvec.shape[2], nrmvec.shape[3]), mtx).view(*nrmvec.shape)
+
+        ambient = dr.texture(self.diffuse[None, ...], nrmvec.contiguous(), filter_mode='linear', boundary_mode='cube')
+
+        NdotV = torch.clamp(util.dot(wo, gb_normal), min=1e-4)
+        fg_uv = torch.cat((NdotV, roughness), dim=-1)
+        if not hasattr(self, '_FG_LUT'):
+            self._FG_LUT = torch.as_tensor(np.fromfile('scene/NVDIFFREC/irrmaps/bsdf_256_256.bin', dtype=np.float32).reshape(1, 256, 256, 2), dtype=torch.float32, device='cuda')
+        fg_lookup = dr.texture(self._FG_LUT, fg_uv, filter_mode='linear', boundary_mode='clamp')
+
+        miplevel = self.get_mip(roughness)
+        spec = dr.texture(self.specular[0][None, ...], reflvec.contiguous(), mip=list(m[None, ...] for m in self.specular[1:]), mip_level_bias=miplevel[..., 0], filter_mode='linear-mipmap-linear', boundary_mode='cube')
+
+        film_thickness = params[..., 0:1]
+        eta2 = params[..., 1:2]
+        eta3 = params[..., 2:3]
+        kappa3 = params[..., 3:4]
+        strength = params[..., 4:5]
+
+        fresnel_rgb = compute_iridescent_fresnel(reflvec, wo, gb_normal, film_thickness, eta2, eta3, kappa3)
+        fresnel_rgb = torch.lerp(torch.ones_like(fresnel_rgb), fresnel_rgb, strength)
+
+        reflectance = fresnel_rgb * fg_lookup[..., 0:1] + fg_lookup[..., 1:2]
+        specular_linear = spec * reflectance
+
+        diffuse_linear = torch.sigmoid(diffuse_raw - np.log(3.0))
+        extras = {
+            "specular": specular_linear,
+            "diffuse": diffuse_linear,
+            "ambient": ambient,
+            "iridescent_fresnel": fresnel_rgb,
+            "iridescent_strength": strength.repeat(1, 1, 1, 3),
+        }
+
+        rgb = specular_linear + diffuse_linear
         return rgb, extras
 
 ######################################################################################

@@ -118,6 +118,21 @@ def delta_normal_loss(delta_normal_norm, alpha=None):
 
     return loss
 
+
+def lpips_loss(network_output, gt, lpips_module):
+    """Compute LPIPS distance between prediction and ground truth."""
+    if network_output.dim() == 3:
+        network_output = network_output.unsqueeze(0)
+        gt = gt.unsqueeze(0)
+
+    pred = network_output * 2.0 - 1.0
+    target = gt * 2.0 - 1.0
+
+    pred = pred.to(dtype=torch.float32)
+    target = target.to(dtype=torch.float32)
+
+    return lpips_module(pred, target).mean()
+
 def cam_depth2world_point(cam_z, pixel_idx, intrinsic, extrinsic):
     '''
     cam_z: (1, N)

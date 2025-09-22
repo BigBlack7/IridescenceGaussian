@@ -12,7 +12,7 @@
 import os
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim, predicted_normal_loss, delta_normal_loss, zero_one_loss
+from utils.loss_utils import l1_loss, ssim, predicted_normal_loss, delta_normal_loss, zero_one_loss, lpips_loss
 from gaussian_renderer import render, network_gui, render_lighting
 import sys
 from scene import Scene, GaussianModel
@@ -24,6 +24,7 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import time
+from torch.cuda.amp import autocast, GradScaler
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -36,6 +37,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
 
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+
+    scaler = GradScaler(enabled=opt.use_amp)
+    lpips_model = None
+    if opt.lambda_lpips > 0:
+        from lpipsPyTorch.modules.lpips import LPIPS
+
+        lpips_model = LPIPS(net_type=opt.lpips_net).to("cuda")
+        lpips_model.eval()
+        lpips_model.requires_grad_(False)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -76,28 +86,47 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
         if pipe.brdf:
             gaussians.set_requires_grad("normal", state=iteration >= opt.normal_reg_from_iter)
             gaussians.set_requires_grad("normal2", state=iteration >= opt.normal_reg_from_iter)
-            if gaussians.brdf_mode=="envmap":
+            if gaussians.brdf_mode in ("envmap", "iridescence"):
                 gaussians.brdf_mlp.build_mips()
 
-        # Render
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, debug=False)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         losses_extra = {}
-        if pipe.brdf and iteration > opt.normal_reg_from_iter:
-            if iteration<opt.normal_reg_util_iter:
-                losses_extra['predicted_normal'] = predicted_normal_loss(render_pkg["normal"], render_pkg["normal_ref"], render_pkg["alpha"])
-            losses_extra['zero_one'] = zero_one_loss(render_pkg["alpha"])
-            if "delta_normal_norm" not in render_pkg.keys() and opt.lambda_delta_reg>0: assert()
-            if "delta_normal_norm" in render_pkg.keys():
-                losses_extra['delta_reg'] = delta_normal_loss(render_pkg["delta_normal_norm"], render_pkg["alpha"])
-
-        # Loss
         gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-        for k in losses_extra.keys():
-            loss += getattr(opt, f'lambda_{k}')* losses_extra[k]
-        loss.backward()
+        with autocast(enabled=opt.use_amp):
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background, debug=False)
+            image = render_pkg["render"]
+            viewspace_point_tensor = render_pkg["viewspace_points"]
+            visibility_filter = render_pkg["visibility_filter"]
+            radii = render_pkg["radii"]
+
+            if pipe.brdf and iteration > opt.normal_reg_from_iter:
+                if iteration < opt.normal_reg_util_iter:
+                    losses_extra['predicted_normal'] = predicted_normal_loss(render_pkg["normal"], render_pkg["normal_ref"], render_pkg["alpha"])
+                losses_extra['zero_one'] = zero_one_loss(render_pkg["alpha"])
+                if "delta_normal_norm" not in render_pkg.keys() and opt.lambda_delta_reg > 0:
+                    assert()
+                if "delta_normal_norm" in render_pkg.keys():
+                    losses_extra['delta_reg'] = delta_normal_loss(render_pkg["delta_normal_norm"], render_pkg["alpha"])
+
+            if pipe.brdf and getattr(opt, "lambda_env_regularizer", 0.0) > 0 and hasattr(gaussians, "brdf_mlp"):
+                losses_extra['env_regularizer'] = gaussians.brdf_mlp.regularizer()
+
+            Ll1 = l1_loss(image, gt_image)
+            recon_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+
+        if lpips_model is not None:
+            with autocast(enabled=False):
+                losses_extra['lpips'] = lpips_loss(image, gt_image, lpips_model)
+
+        loss = recon_loss.float()
+        for key, value in list(losses_extra.items()):
+            weight = getattr(opt, f'lambda_{key}', 0.0)
+            if weight != 0.0:
+                loss = loss + value.float() * weight
+
+        if opt.use_amp:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
         iter_end.record()
 
@@ -133,11 +162,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
 
             # Optimizer step
             if iteration < opt.iterations:
-                gaussians.optimizer.step()
+                if opt.use_amp:
+                    scaler.step(gaussians.optimizer)
+                    scaler.update()
+                else:
+                    gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
                 gaussians.update_learning_rate(iteration)
 
-            if pipe.brdf and pipe.brdf_mode=="envmap":
+            if pipe.brdf and pipe.brdf_mode in ("envmap", "iridescence"):
                 gaussians.brdf_mlp.clamp_(min=0.0, max=1.0)
 
 def prepare_output_and_logger(args):    
