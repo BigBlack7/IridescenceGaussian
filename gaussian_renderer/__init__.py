@@ -46,7 +46,7 @@ def render_normal(viewpoint_cam, depth, bg_color, alpha):
 
 # render 360 lighting for a single gaussian
 def render_lighting(pc : GaussianModel, resolution=(512, 1024), sampled_index=None):
-    if pc.brdf_mode=="envmap":
+    if pc.brdf_mode in ("envmap", "iridescence"):
         lighting = extract_env_map(pc.brdf_mlp, resolution) # (H, W, 3)
         lighting = lighting.permute(2,0,1) # (3, H, W)
     else:
@@ -126,20 +126,23 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         if pipe.brdf:
             color_delta = None
             delta_normal_norm = None
-            if pipe.brdf_mode=="envmap":
-                gb_pos = pc.get_xyz # (N, 3) 
-                view_pos = viewpoint_camera.camera_center.repeat(pc.get_opacity.shape[0], 1) # (N, 3) 
+            if pipe.brdf_mode in ("envmap", "iridescence"):
+                gb_pos = pc.get_xyz # (N, 3)
+                view_pos = viewpoint_camera.camera_center.repeat(pc.get_opacity.shape[0], 1) # (N, 3)
 
-                diffuse   = pc.get_diffuse # (N, 3) 
-                normal, delta_normal = pc.get_normal(dir_pp_normalized=dir_pp_normalized, return_delta=True) # (N, 3) 
+                diffuse   = pc.get_diffuse # (N, 3)
+                normal, delta_normal = pc.get_normal(dir_pp_normalized=dir_pp_normalized, return_delta=True) # (N, 3)
                 delta_normal_norm = delta_normal.norm(dim=1, keepdim=True)
-                specular  = pc.get_specular # (N, 3) 
-                roughness = pc.get_roughness # (N, 1) 
-                color, brdf_pkg = pc.brdf_mlp.shade(gb_pos[None, None, ...], normal[None, None, ...], diffuse[None, None, ...], specular[None, None, ...], roughness[None, None, ...], view_pos[None, None, ...])
+                specular  = pc.get_specular
+                roughness = pc.get_roughness # (N, 1)
+                if pipe.brdf_mode == "envmap":
+                    color, brdf_pkg = pc.brdf_mlp.shade(gb_pos[None, None, ...], normal[None, None, ...], diffuse[None, None, ...], specular[None, None, ...], roughness[None, None, ...], view_pos[None, None, ...])
+                else:
+                    color, brdf_pkg = pc.brdf_mlp.shade_iridescent(gb_pos[None, None, ...], normal[None, None, ...], diffuse[None, None, ...], specular[None, None, ...], roughness[None, None, ...], view_pos[None, None, ...])
 
-                colors_precomp = color.squeeze() # (N, 3) 
-                diffuse_color = brdf_pkg['diffuse'].squeeze() # (N, 3) 
-                specular_color = brdf_pkg['specular'].squeeze() # (N, 3) 
+                colors_precomp = color.squeeze() # (N, 3)
+                diffuse_color = brdf_pkg['diffuse'].squeeze() # (N, 3)
+                specular_color = brdf_pkg['specular'].squeeze() # (N, 3)
 
                 if pc.brdf_dim>0:
                     shs_view = pc.get_brdf_features.view(-1, 3, (pc.brdf_dim+1)**2)

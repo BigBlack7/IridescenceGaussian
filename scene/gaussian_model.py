@@ -22,6 +22,12 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation, get_minimum_axis, flip_align_view
 import open3d as o3d
 from scene.NVDIFFREC import create_trainable_env_rnd, load_env
+from scene.NVDIFFREC.iridescence_config import (
+    IRIDESCENT_PARAM_RANGES,
+    build_specular_raw_init,
+    default_param_tensor,
+    iridescent_param_is_learnable,
+)
 
 class GaussianModel:
     def __init__(self, sh_degree : int, brdf_dim : int, brdf_mode : str, brdf_envmap_res: int):
@@ -128,6 +134,32 @@ class GaussianModel:
 
     @property
     def get_specular(self):
+        if self.brdf and self.brdf_mode == "iridescence":
+            def _sigmoid_range(channel: torch.Tensor, key: str) -> torch.Tensor:
+                lo, hi = IRIDESCENT_PARAM_RANGES[key]
+                return torch.sigmoid(channel) * (hi - lo) + lo
+
+            film_thickness = _sigmoid_range(self._specular[:, 0:1], "film_thickness")
+            if not iridescent_param_is_learnable("film_thickness"):
+                film_thickness = default_param_tensor("film_thickness", film_thickness)
+
+            eta2 = _sigmoid_range(self._specular[:, 1:2], "eta2")
+            if not iridescent_param_is_learnable("eta2"):
+                eta2 = default_param_tensor("eta2", eta2)
+
+            eta3 = _sigmoid_range(self._specular[:, 2:3], "eta3")
+            if not iridescent_param_is_learnable("eta3"):
+                eta3 = default_param_tensor("eta3", eta3)
+
+            kappa3 = _sigmoid_range(self._specular[:, 3:4], "kappa3")
+            if not iridescent_param_is_learnable("kappa3"):
+                kappa3 = default_param_tensor("kappa3", kappa3)
+
+            strength = torch.sigmoid(self._specular[:, 4:5])
+            if not iridescent_param_is_learnable("strength"):
+                strength = default_param_tensor("strength", strength)
+
+            return torch.cat((film_thickness, eta2, eta3, kappa3, strength), dim=1)
         return self.specular_activation(self._specular)
 
     @property
@@ -154,12 +186,12 @@ class GaussianModel:
             features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
             features[:, :3, 0 ] = fused_color
             features[:, 3:, 1:] = 0.0
-        elif (self.brdf_mode=="envmap" and self.brdf_dim==0):
+        elif (self.brdf_mode in ("envmap", "iridescence") and self.brdf_dim==0):
             fused_color = torch.tensor(np.asarray(pcd.colors)).float().cuda()
             features = torch.zeros((fused_color.shape[0], self.brdf_dim + 3)).float().cuda()
             features[:, :3 ] = fused_color
             features[:, 3: ] = 0.0
-        elif self.brdf_mode=="envmap" and self.brdf_dim>0:
+        elif self.brdf_mode in ("envmap", "iridescence") and self.brdf_dim>0:
             fused_color = torch.tensor(np.asarray(pcd.colors)).float().cuda()
             features = torch.zeros((fused_color.shape[0], 3)).float().cuda()
             features[:, :3 ] = fused_color
@@ -183,17 +215,25 @@ class GaussianModel:
             self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
         else:
             self._features_dc = nn.Parameter(features[:,:3].contiguous().requires_grad_(True))
-            if (self.brdf_mode=="envmap" and self.brdf_dim==0):
+            if (self.brdf_mode in ("envmap", "iridescence") and self.brdf_dim==0):
                 self._features_rest = nn.Parameter(features[:,3:].contiguous().requires_grad_(True))
-            elif self.brdf_mode=="envmap":
+            elif self.brdf_mode in ("envmap", "iridescence"):
                 self._features_rest = nn.Parameter(features_rest.contiguous().requires_grad_(True))
 
             normals = np.zeros_like(np.asarray(pcd.points, dtype=np.float32))
             normals2 = np.copy(normals)
 
             self._normal = nn.Parameter(torch.from_numpy(normals).to(self._xyz.device).requires_grad_(True))
-            specular_len = 3 
-            self._specular = nn.Parameter(torch.zeros((fused_point_cloud.shape[0], specular_len), device="cuda").requires_grad_(True))
+            specular_len = 5 if self.brdf_mode == "iridescence" else 3
+            if self.brdf_mode == "iridescence":
+                specular_init = build_specular_raw_init(
+                    fused_point_cloud.shape[0],
+                    device=fused_point_cloud.device,
+                    dtype=fused_point_cloud.dtype,
+                )
+            else:
+                specular_init = torch.zeros((fused_point_cloud.shape[0], specular_len), device="cuda")
+            self._specular = nn.Parameter(specular_init.requires_grad_(True))
             self._roughness = nn.Parameter(self.default_roughness*torch.ones((fused_point_cloud.shape[0], 1), device="cuda").requires_grad_(True))
             self._normal2 = nn.Parameter(torch.from_numpy(normals2).to(self._xyz.device).requires_grad_(True))
 
@@ -292,9 +332,9 @@ class GaussianModel:
                 l.append('f_dc_{}'.format(i))
             if viewer_fmt:
                 features_rest_len = 45
-            elif (self.brdf_mode=="envmap" and self.brdf_dim==0):
+            elif (self.brdf_mode in ("envmap", "iridescence") and self.brdf_dim==0):
                 features_rest_len = self._features_rest.shape[1]
-            elif self.brdf_mode=="envmap":
+            elif self.brdf_mode in ("envmap", "iridescence"):
                 features_rest_len = self._features_rest.shape[1]*self._features_rest.shape[2]
             for i in range(features_rest_len):
                 l.append('f_rest_{}'.format(i))
@@ -316,7 +356,7 @@ class GaussianModel:
         normals = np.zeros_like(xyz) if not self.brdf else self._normal.detach().cpu().numpy()
         normals2 = self._normal2.detach().cpu().numpy() if (self.brdf) else np.zeros_like(xyz)
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy() if not self.brdf else self._features_dc.detach().cpu().numpy()
-        f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy() if not ((self.brdf and self.brdf_mode=="envmap" and self.brdf_dim==0)) else self._features_rest.detach().cpu().numpy()
+        f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy() if not ((self.brdf and self.brdf_mode in ("envmap", "iridescence") and self.brdf_dim==0)) else self._features_rest.detach().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
@@ -378,7 +418,7 @@ class GaussianModel:
                 features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
             # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
             features_extra = features_extra.reshape((features_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1))
-        elif self.brdf_mode=="envmap":
+        elif self.brdf_mode in ("envmap", "iridescence"):
             features_extra = np.zeros((xyz.shape[0], 3*(self.brdf_dim + 1) ** 2 ))
             if len(extra_f_names)==3*(self.brdf_dim + 1) ** 2:
                 for idx, attr_name in enumerate(extra_f_names):
@@ -421,7 +461,7 @@ class GaussianModel:
 
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
         self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True)) if not self.brdf else nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True)) if not ((self.brdf and self.brdf_mode=="envmap")) else nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True)) if not ((self.brdf and self.brdf_mode in ("envmap", "iridescence"))) else nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").requires_grad_(True))
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
@@ -566,7 +606,7 @@ class GaussianModel:
         new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1) if not self.brdf else self._features_dc[selected_pts_mask].repeat(N,1)
-        new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1) if not ((self.brdf and self.brdf_mode=="envmap" and self.brdf_dim==0)) else self._features_rest[selected_pts_mask].repeat(N,1)
+        new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1) if not ((self.brdf and self.brdf_mode in ("envmap", "iridescence") and self.brdf_dim==0)) else self._features_rest[selected_pts_mask].repeat(N,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_roughness = self._roughness[selected_pts_mask].repeat(N,1) if self.brdf else None
         new_specular = self._specular[selected_pts_mask].repeat(N,1) if self.brdf else None
